@@ -2,33 +2,158 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["main"]
   pull_request:
+    branches: ["main"]
   workflow_dispatch:
+    inputs:
+      tokenizer:
+        description: "Вариант токенизации (из tokenizers/)"
+        required: true
+        default: "bpe"
+        type: choice
+        options:
+          - char
+          - bpe
+          - word
+      embedding:
+        description: "Вариант эмбеддинга (из embeddings/)"
+        required: true
+        default: "rope"
+        type: choice
+        options:
+          - learned
+          - sinusoidal
+          - rope
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  structure-and-syntax:
+    name: Синтаксис и AST-правило calls-only
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check (весь проект, включая tokenizers/ и embeddings/)
+        run: python -m compileall -q .
+
+      - name: Structure test (calls-only + контракты пакетов)
+        run: python -m unittest tests/test_structure.py -v
+
+  test-pipeline:
+    name: Тест (${{ matrix.tokenizer }} + ${{ matrix.embedding }})
+    needs: structure-and-syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        tokenizer: ["char", "bpe", "word"]
+        embedding: ["learned", "sinusoidal", "rope"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Syntax check
-        run: python -m py_compile main.py
+      - name: Runtime unittest (ТОКЕН -> ЭМБЕДИНГ -> GPT -> ОБУЧАЕМ -> ТЕСТ)
+        env:
+          MICROGPT_TOKENIZER: ${{ github.event.inputs.tokenizer || matrix.tokenizer }}
+          MICROGPT_EMBEDDING: ${{ github.event.inputs.embedding || matrix.embedding }}
+        run: python -m unittest tests/test_pipeline.py -v
 
-      - name: Structure test
-        run: python -m unittest discover -s tests -v
+      - name: Контрольный прогон pipeline() и сохранение метрик
+        env:
+          MICROGPT_TOKENIZER: ${{ github.event.inputs.tokenizer || matrix.tokenizer }}
+          MICROGPT_EMBEDDING: ${{ github.event.inputs.embedding || matrix.embedding }}
+        run: |
+          python main.py \
+            --tokenizer "$MICROGPT_TOKENIZER" \
+            --embedding "$MICROGPT_EMBEDDING" \
+            --steps 20 \
+            --samples 3 \
+            --offline \
+            --json-out "metrics-${{ matrix.tokenizer }}-${{ matrix.embedding }}.json"
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ matrix.tokenizer }}-${{ matrix.embedding }}
+          path: metrics-*.json
+
+  publish-pr-report:
+    name: Сводка метрик в Pull Request
+    needs: test-pipeline
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Comment PR with test table
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const rows = [];
+            for (const dir of fs.readdirSync('artifacts')) {
+              const files = fs.readdirSync(path.join('artifacts', dir));
+              for (const f of files.filter(x => x.endsWith('.json'))) {
+                const m = JSON.parse(fs.readFileSync(path.join('artifacts', dir, f), 'utf8'));
+                rows.push(`| ${m.tokenizer} | ${m.embedding} | ${m.vocab_size} | ${m.num_params} | ${m.test_loss.toFixed(4)} | ${m.perplexity.toFixed(2)} | ${m.passed ? 'PASS' : 'FAIL'} |`);
+              }
+            }
+            const body = [
+              '### Результаты GitHub Actions (Pure Python · calls-only pipeline)',
+              '',
+              '| Токенизатор | Эмбеддинг | Словарь | Параметры | Test Loss | Perplexity | Статус |',
+              '| --- | --- | ---: | ---: | ---: | ---: | --- |',
+              ...rows
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  deploy-package:
+    name: Автосборка релиза (main)
+    needs: test-pipeline
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Сборка чистого Python-архива
+        run: |
+          mkdir -p dist
+          python -m zipfile -c dist/gpttest-pure-python.zip main.py pipeline.py stages.py structs.py autograd.py tokenizers/ embeddings/ README.md
+
+      - name: Публикация артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpttest-${{ github.sha }}
+          path: dist/

@@ -1,3 +1,5 @@
+"""AST-проверка правила calls-only для pipeline.py и stages.py + проверка пакетов."""
+
 import ast
 import pathlib
 import unittest
@@ -5,9 +7,10 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 ORCHESTRATORS = {
-    "main.py": [
-        "pipeline",
+    "pipeline.py": ["pipeline"],
+    "stages.py": [
         "sample",
+        "split",
         "tokenize",
         "embed",
         "build_gpt",
@@ -18,12 +21,16 @@ ORCHESTRATORS = {
 }
 
 
-def functions_of(path):
+def functions_of(path: pathlib.Path):
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    return {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
 
 
-def body_without_docstring(function):
+def body_without_docstring(function: ast.FunctionDef):
     body = list(function.body)
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         if isinstance(body[0].value.value, str):
@@ -46,15 +53,39 @@ class CallsOnlyTest(unittest.TestCase):
                 with self.subTest(function=name):
                     self.check_function(functions[name], filename)
 
-    def check_function(self, function, filename):
+    def test_plugin_modules_expose_entry_functions(self):
+        for folder, expected_fn in (("tokenizers", "tokenize"), ("embeddings", "embed")):
+            pkg_dir = ROOT / folder
+            module_files = [
+                p for p in pkg_dir.glob("*.py") if p.name != "__init__.py"
+            ]
+            self.assertTrue(module_files, f"Папка {folder}/ должна содержать модули")
+            for mod_file in module_files:
+                with self.subTest(file=f"{folder}/{mod_file.name}"):
+                    funcs = functions_of(mod_file)
+                    self.assertIn(
+                        expected_fn,
+                        funcs,
+                        f"{folder}/{mod_file.name}: ожидается функция {expected_fn}()",
+                    )
+
+    def check_function(self, function: ast.FunctionDef, filename: str):
         where = f"{filename}:{function.name}"
         body = body_without_docstring(function)
         self.assertTrue(body, f"{where}: пустое тело")
-
         for statement in body:
             if isinstance(
                 statement,
-                (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.AugAssign, ast.Raise, ast.Delete),
+                (
+                    ast.If,
+                    ast.For,
+                    ast.While,
+                    ast.Try,
+                    ast.With,
+                    ast.AugAssign,
+                    ast.Raise,
+                    ast.Delete,
+                ),
             ):
                 self.fail(
                     f"{where}: строка {statement.lineno} — {type(statement).__name__}. "
@@ -74,13 +105,12 @@ class CallsOnlyTest(unittest.TestCase):
                     f"{type(statement).__name__}"
                 )
 
-    def check_return(self, statement, where):
+    def check_return(self, statement: ast.Return, where: str):
         value = statement.value
         if value is None or isinstance(value, (ast.Name, ast.Call)):
             return
         self.fail(
-            f"{where}: строка {statement.lineno} — return должен возвращать вызов "
-            "или переменную"
+            f"{where}: строка {statement.lineno} — return должен возвращать вызов или переменную"
         )
 
 

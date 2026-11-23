@@ -5,10 +5,9 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 ORCHESTRATORS = {
-    "pipeline.py": ["pipeline"],
-    "stages.py": [
+    "main.py": [
+        "pipeline",
         "sample",
-        "split",
         "tokenize",
         "embed",
         "build_gpt",

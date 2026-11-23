@@ -2,7 +2,9 @@ import json
 import math
 import os
 import random
+import sys
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 random.seed(42)
 
 if not os.path.exists("input.txt"):
